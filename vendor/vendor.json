@@ -1,0 +1,42 @@
+{
+	"comment": "",
+	"ignore": "test",
+	"heroku": {
+        "install": [ "./..." ],
+        "goVersion": "go1.14"
+        "sync": true
+    },
+    "package": [
+		{
+			"checksumSHA1": "XCFDr6QvMUzfbvy1VGw4cMWhf18=",
+			"path": "github.com/PuerkitoBio/goquery",
+			"revision": "844d6bd46b293ce07cd2e48d259f6ea2b48e31b6",
+			"revisionTime": "2020-02-24T23:34:32Z"
+		},
+		{
+			"checksumSHA1": "P4cfR9LgQ13Ak2wD4Z3wpd9zMMw=",
+			"path": "github.com/andybalholm/cascadia",
+			"revision": "903109d295d56a99095f2cfab0c2ca8d4b22f648",
+			"revisionTime": "2019-11-15T16:53:31Z"
+		},
+		{
+			"checksumSHA1": "+ze/R7mgeilvYDWnkTC9jSp6z0g=",
+			"path": "github.com/go-sql-driver/mysql",
+			"revision": "dd9d356b496cd5c37543d3dd0ffbef75714b88ec",
+			"revisionTime": "2020-02-25T15:24:38Z"
+		},
+		{
+			"checksumSHA1": "ozmp2tE2nJYZxhYAj0VwHS0Vz1U=",
+			"path": "golang.org/x/net/html",
+			"revision": "0de0cce0169b09b364e001f108dc0399ea8630b3",
+			"revisionTime": "2020-02-24T13:13:14Z"
+		},
+		{
+			"checksumSHA1": "xwhqe/igHQrY3IhqDwzo6j7qpm8=",
+			"path": "golang.org/x/net/html/atom",
+			"revision": "0de0cce0169b09b364e001f108dc0399ea8630b3",
+			"revisionTime": "2020-02-24T13:13:14Z"
+		}
+	],
+	"rootPath": "circolari"
+}
