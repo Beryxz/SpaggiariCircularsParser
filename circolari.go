@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -28,7 +29,7 @@ type moreCircolariMsg struct {
 }
 
 type attachment struct {
-	Id uint64
+	Id    uint64
 	Title string
 }
 
@@ -95,13 +96,13 @@ func findNodeWithContext(context string, s []*html.Node) (node *html.Node, exist
 	return nil, false
 }
 
-func parseCirculars(circularsHtml *strings.Reader) (circulars []circular, canceled []circular, err error) {
+func parseCirculars(circularsHtml *strings.Reader) (circulars []circular, err error) {
 	numRowResult := 0
 
 	// Load the HTML doc
 	doc, err := goquery.NewDocumentFromReader(circularsHtml)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	// Parse single circular
@@ -109,13 +110,13 @@ func parseCirculars(circularsHtml *strings.Reader) (circulars []circular, cancel
 		// Parse circular ID
 		var id uint64
 		idStr, exist := row.Find(".download-file").Attr("id_doc")
-		noId := !exist
-		if !noId {
-			id, err = strconv.ParseUint(idStr, 10, 64)
-			if err != nil {
-				log.Println("ERROR: can't parse id to int. Skipping")
-				return
-			}
+		if !exist {
+			return
+		}
+		id, err := strconv.ParseUint(idStr, 10, 64)
+		if err != nil {
+			log.Println("ERROR: can't parse id to int. Skipping")
+			return
 		}
 
 		// Get useful tag references
@@ -154,30 +155,27 @@ func parseCirculars(circularsHtml *strings.Reader) (circulars []circular, cancel
 			return
 		}
 
-		if !noId {
-			var attachments []attachment
-			// Parse attachments, tag with class 'link-to-file' inside infoColumn
-			infoColumn.Find(".link-to-file").Each(func(i int, a *goquery.Selection) {
-				if idDocStr, exists := a.Attr("id_doc"); exists {
-					idDoc, err := strconv.ParseUint(idDocStr, 10, 64)
-					if err != nil {
-						log.Printf("WARNING: can't parse circular(%d) attachment. Skipping attachment\n", id)
-						return
-					}
-					title := a.Text()
-					attachments = append(attachments, attachment{idDoc, title})
+		var attachments []attachment
+		// Parse attachments, tag with class 'link-to-file' inside infoColumn
+		infoColumn.Find(".link-to-file").Each(func(i int, a *goquery.Selection) {
+			if idDocStr, exists := a.Attr("id_doc"); exists {
+				idDoc, err := strconv.ParseUint(idDocStr, 10, 64)
+				if err != nil {
+					log.Printf("WARNING: can't parse circular(%d) attachment. Skipping attachment\n", id)
+					return
 				}
-			})
+				title := a.Text()
+				attachments = append(attachments, attachment{idDoc, title})
+			}
+		})
 
-			// Add parsed circular to array
-			circulars = append(circulars, circular{id, title, category.Data, publishedDate, validUntilDate, attachments})
-		} else {
-			canceled = append(canceled, circular{0, title, category.Data, publishedDate, validUntilDate, nil})
-		}
+		// Add parsed circular to array
+		circulars = append(circulars, circular{id, title, category.Data, publishedDate, validUntilDate, attachments})
+
 		numRowResult++
 	})
 
-	return circulars, canceled,nil
+	return circulars, nil
 }
 
 func loadConfiguration(filename string) (*dbConfig, error) {
@@ -194,7 +192,7 @@ func loadConfiguration(filename string) (*dbConfig, error) {
 	return config, nil
 }
 
-func insertCirculars(circulars []circular, canceled []circular, connectionString string) error {
+func insertCirculars(circulars []circular, numToUpdate int, connectionString string) error {
 	db, err := sql.Open("mysql", connectionString)
 	if err != nil {
 		return err
@@ -211,15 +209,24 @@ func insertCirculars(circulars []circular, canceled []circular, connectionString
 	}
 
 	// Insert for each circular
-	for _, c := range circulars {
+	for idx, c := range circulars {
+		// Updates only latest 'numToUpdate' circulars
+		queryCircular := "INSERT IGNORE INTO `circolare` (id, titolo, categoria, `data`, valida_fino, aggiunta_il) VALUES (?, ?, ?, ?, ?, ?)"
+		queryAttachment := "INSERT IGNORE INTO `circolare_allegato` (id_allegato, titolo, id_circolare) VALUES (?, ?, ?)"
+		if idx < numToUpdate {
+			queryCircular = "INSERT INTO `circolare` (id, titolo, categoria, `data`, valida_fino, aggiunta_il) VALUES (?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE titolo = VALUES(titolo), categoria = VALUES(categoria), `data` = VALUES(`data`), valida_fino = VALUES(valida_fino)"
+			queryAttachment = "INSERT INTO `circolare_allegato` (id_allegato, titolo, id_circolare) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE titolo = VALUES(titolo)"
+		}
+
 		_, err = tx.Exec(
-			"INSERT IGNORE INTO `circolare` (id, titolo, categoria, `data`, valida_fino, aggiunta_il) VALUES (?, ?, ?, ?, ?, ?)",
+			// INSERT IGNORE would be better but circulars must not be deleted from website (not our case)
+			queryCircular,
 			c.Id,
 			c.Title,
 			c.Category,
 			c.PublishedDate.Format("2006-01-02"),
 			c.ValidUntilDate.Format("2006-01-02"),
-			time.Now().Format(time.RFC3339))
+			time.Now().UTC().Format(time.RFC3339))
 		if err != nil {
 			return err
 		}
@@ -227,7 +234,8 @@ func insertCirculars(circulars []circular, canceled []circular, connectionString
 		// Insert circulars attachments
 		for _, att := range c.Attachments {
 			_, err = tx.Exec(
-				"INSERT IGNORE INTO `circolare_allegato` (id_allegato, titolo, id_circolare) VALUES (?, ?, ?)",
+				// INSERT IGNORE would be better but circulars must not be deleted from website (not our case)
+				queryAttachment,
 				att.Id,
 				att.Title,
 				c.Id)
@@ -237,21 +245,96 @@ func insertCirculars(circulars []circular, canceled []circular, connectionString
 		}
 	}
 
-	// Try to remove circulars that are now canceled
-	for _, c := range canceled {
-		_, err = tx.Exec(
-			"DELETE FROM `circolare` WHERE titolo = ? AND categoria = ? AND `data` = ? AND valida_fino = ?,",
-			c.Title,
-			c.Category,
-			c.PublishedDate.Format("2006-01-02"),
-			c.ValidUntilDate.Format("2006-01-02"))
-	}
-
 	if err := tx.Commit(); err != nil {
 		return err
 	}
 
 	return nil
+}
+
+func deleteRemoveCirculars(circulars []circular, connectionString string) (removedCirculars, removedAttachments int, err error) {
+	db, err := sql.Open("mysql", connectionString)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer db.Close()
+
+	if err := db.Ping(); err != nil {
+		return 0, 0, err
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+
+	// Get parsed ids
+	var parsedCircId, parsedAttachId []uint64
+	for _, c := range circulars {
+		parsedCircId = append(parsedCircId, c.Id)
+
+		for _, att := range c.Attachments {
+			parsedAttachId = append(parsedAttachId, att.Id)
+		}
+	}
+	sort.Slice(parsedCircId, func(i, j int) bool { return parsedCircId[i] > parsedCircId[j] })
+	sort.Slice(parsedAttachId, func(i, j int) bool { return parsedAttachId[i] > parsedAttachId[j] })
+
+	// Get db ids
+	var dbCircularsId, dbAttachmentsId []uint64
+	var id uint64
+
+	//TODO use multipleResultSets query
+	rowsCirculars, errC := tx.Query("SELECT id FROM circolare ORDER BY id DESC")
+	if errC != nil {
+		log.Fatal(errC)
+	}
+	defer rowsCirculars.Close()
+	for rowsCirculars.Next() {
+		if err := rowsCirculars.Scan(&id); err != nil {
+			log.Fatal(err)
+		}
+		dbCircularsId = append(dbCircularsId, id)
+	}
+
+	rowsAttachments, errA := tx.Query("SELECT id_allegato id FROM circolare_allegato ORDER BY id DESC")
+	if errA != nil {
+		log.Fatal(errA)
+	}
+	defer rowsAttachments.Close()
+	for rowsAttachments.Next() {
+		if err := rowsAttachments.Scan(&id); err != nil {
+			log.Fatal(err)
+		}
+		dbAttachmentsId = append(dbAttachmentsId, id)
+	}
+
+	// Search db ids that weren't parsed
+	var idsCircToRemove, idsAttachToRemove []uint64
+	for _, id := range dbCircularsId {
+		if idx := sort.Search(len(parsedCircId), func(i int) bool { return parsedCircId[i] <= id }); parsedCircId[idx] != id {
+			idsCircToRemove = append(idsCircToRemove, id)
+		}
+	}
+	for _, id := range dbAttachmentsId {
+		if idx := sort.Search(len(parsedAttachId), func(i int) bool { return parsedAttachId[i] <= id }); parsedAttachId[idx] != id {
+			idsAttachToRemove = append(idsAttachToRemove, id)
+		}
+	}
+
+	// Delete removed circulars
+	for _, id := range idsAttachToRemove {
+		tx.Exec("DELETE FROM `circolare_allegato` WHERE id_allegato = ?", id)
+	}
+	for _, id := range idsCircToRemove {
+		tx.Exec("DELETE FROM `circolare` WHERE id = ?", id)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+
+	return len(idsCircToRemove), len(idsAttachToRemove), nil
 }
 
 func main() {
@@ -275,12 +358,12 @@ func main() {
 	}
 
 	// First time execute without waiting
-	nextTime := time.Now()
-	// Execute forever in a loop
+	nextTime := time.Now().UTC()
+	nextCleanupTime := nextTime
 	for {
 		// Wait for next round
 		time.Sleep(time.Until(nextTime))
-		nextTime = time.Now().Truncate(time.Minute).Add(5 * time.Minute)
+		nextTime = nextTime.Truncate(time.Minute).Add(5 * time.Minute)
 
 		// Get Circulars to parse
 		log.Printf("INFO: getting circulars")
@@ -292,21 +375,34 @@ func main() {
 
 		// Parse circulars
 		log.Printf("INFO: parsing circulars")
-		circulars, canceled, err := parseCirculars(circularsHtml)
+		circulars, err := parseCirculars(circularsHtml)
 		if err != nil {
 			log.Printf("ERROR: %v", err)
 			continue
 		}
-		log.Printf("INFO: parsed %d circulars\n", len(circulars) + len(canceled))
+		log.Printf("INFO: parsed %d circulars", len(circulars))
 
 		// Updates DB
 		log.Printf("INFO: updating DB")
-		err = insertCirculars(circulars, canceled, connectionString)
+		err = insertCirculars(circulars, 25, connectionString)
 		if err != nil {
 			log.Printf("ERROR: %v", err)
 			continue
 		}
-		log.Println("INFO: updated DB")
+		log.Printf("INFO: updated DB")
+
+		// Remove deleted circulars with a lower frequency
+		if nextTime.After(nextCleanupTime) {
+			nextCleanupTime = nextTime.Truncate(time.Hour).Add(6 * time.Hour)
+
+			log.Printf("INFO: removing deleted circulars")
+			removedCirculars, removedAttachments, err := deleteRemoveCirculars(circulars, connectionString)
+			if err != nil {
+				log.Printf("ERROR: %v", err)
+				continue
+			}
+			log.Printf("INFO: removed %d circulars and %d attachments", removedCirculars, removedAttachments)
+		}
 
 		log.Println("INFO: waiting")
 	}
