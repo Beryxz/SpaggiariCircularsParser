@@ -1,3 +1,8 @@
+// package main contains the Main function where everything happens.
+// The following ENV variables are required.
+// CIRCULARS_DB_CONNECTION_STRING=db_user:db_pass@tcp(db_host:db_port)/db_name
+// CIRCULARS_SITE_URL=https://web.spaggiari.eu/sdg/app/default/comunicati.php?sede_codice=XXXX0000
+// CIRCULARS_CYCLE_WAIT=5m
 package main
 
 import (
@@ -17,7 +22,9 @@ import (
 	"time"
 )
 
-type moreCircolariMsg struct {
+// type moreCircularsMsg is used for parsing the response after asking if there are more circulars to be loaded.
+// This is required since the server only send 100 circulars at a time
+type moreCircularsMsg struct {
 	Status bool
 	Data   int
 	Err    string
@@ -48,12 +55,12 @@ type dbConfig struct {
 	ConnectionString string
 }
 
-// getCircolari returns all the circulars from the "segreteria digitale of itismeucci" as parsable html
-func getCirculars() (*strings.Reader, error) {
-	siteUrl := "https://web.spaggiari.eu/sdg/app/default/comunicati.php?sede_codice=XXXX0000"
+// getCirculars returns all the circulars from the "segreteria digitale" of your school as parsable html.
+// siteUrl -> "https://web.spaggiari.eu/sdg/app/default/comunicati.php?sede_codice=XXXX0000"
+func getCirculars(siteUrl string) (*strings.Reader, error) {
 	client := &http.Client{}
 	count := 0
-	circolariHtml := ""
+	circularsHtml := ""
 
 	// get circulars 100 per request
 	for {
@@ -69,20 +76,20 @@ func getCirculars() (*strings.Reader, error) {
 			return nil, err
 		}
 
-		var m moreCircolariMsg
+		var m moreCircularsMsg
 		if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
 			return nil, errors.New("can't parse response body")
 		}
 		resp.Body.Close()
 
-		circolariHtml += m.Htm
+		circularsHtml += m.Htm
 		if m.Cnt <= 0 {
 			break
 		}
 		count += 100
 	}
 
-	return strings.NewReader("<html><body><table>" + circolariHtml + "</table></body></html>"), nil
+	return strings.NewReader("<html><body><table>" + circularsHtml + "</table></body></html>"), nil
 }
 
 // findNodeWithContext search the first node where the previous sibling Data contains the substring passed in as context.
@@ -96,6 +103,7 @@ func findNodeWithContext(context string, s []*html.Node) (node *html.Node, exist
 	return nil, false
 }
 
+// function parseCirculars parses the html structure that's received
 func parseCirculars(circularsHtml *strings.Reader) (circulars []circular, err error) {
 	numRowResult := 0
 
@@ -178,6 +186,7 @@ func parseCirculars(circularsHtml *strings.Reader) (circulars []circular, err er
 	return circulars, nil
 }
 
+// loadConfiguration loads db config from file
 func loadConfiguration(filename string) (*dbConfig, error) {
 	configFile, err := os.Open(filename)
 	if err != nil {
@@ -252,7 +261,7 @@ func insertCirculars(circulars []circular, numToUpdate int, connectionString str
 	return nil
 }
 
-func deleteRemoveCirculars(circulars []circular, connectionString string) (removedCirculars, removedAttachments int, err error) {
+func deleteRemovedCirculars(circulars []circular, connectionString string) (removedCirculars, removedAttachments int, err error) {
 	db, err := sql.Open("mysql", connectionString)
 	if err != nil {
 		return 0, 0, err
@@ -284,7 +293,7 @@ func deleteRemoveCirculars(circulars []circular, connectionString string) (remov
 	var dbCircularsId, dbAttachmentsId []uint64
 	var id uint64
 
-	//TODO use multipleResultSets query
+	//TODO use multipleResultSets query to improve perfomance
 	rowsCirculars, errC := tx.Query("SELECT id FROM circolare ORDER BY id DESC")
 	if errC != nil {
 		log.Fatal(errC)
@@ -337,13 +346,16 @@ func deleteRemoveCirculars(circulars []circular, connectionString string) (remov
 	return len(idsCircToRemove), len(idsAttachToRemove), nil
 }
 
+// Main function get the configuration from env variables and the execute the worker cycle.
+// get circulars -> parse circulars -> update DB
+// On a lower frequency it also remove from the DB deleted circulars
 func main() {
+	// Get db configs
 	var connectionString string
-	if envVar, exists := os.LookupEnv("DB_CONNECTION_STRING"); exists {
+	if envVar, exists := os.LookupEnv("CIRCULARS_DB_CONNECTION_STRING"); exists {
 		connectionString = envVar
 	} else {
 		// Try reading form filename received as cli argument
-
 		if argsLen := len(os.Args); argsLen < 2 {
 			log.Fatal("ERROR: Missing script argument -> ./circolari <sqlcredentials-path>")
 		}
@@ -357,17 +369,38 @@ func main() {
 		connectionString = dbConfig.ConnectionString
 	}
 
+	// Get circulars siteUrl
+	var siteUrl string
+	if envVar, exists := os.LookupEnv("CIRCULARS_SITE_URL"); exists {
+		siteUrl = envVar
+	} else {
+		log.Fatal("ERROR: Missing CIRCULARS_SITE_URL env variable")
+	}
+
+	// Get minutes between work cycles
+	var parseTimeout time.Duration
+	if envVar, exists := os.LookupEnv("CIRCULARS_CYCLE_WAIT"); exists {
+		if i, err := time.ParseDuration(envVar); err == nil {
+			log.Printf("INFO: duration set to %f minutes", i.Minutes())
+			parseTimeout = i
+		} else {
+			log.Fatal("ERROR: CIRCULARS_CYCLE_WAIT isn't a parsable Duration")
+		}
+	} else {
+		log.Fatal("ERROR: Missing CIRCULARS_CYCLE_WAIT env variable")
+	}
+
 	// First time execute without waiting
 	nextTime := time.Now().UTC()
 	nextCleanupTime := nextTime
 	for {
 		// Wait for next round
 		time.Sleep(time.Until(nextTime))
-		nextTime = nextTime.Truncate(time.Minute).Add(5 * time.Minute)
+		nextTime = nextTime.Truncate(time.Minute).Add(parseTimeout)
 
 		// Get Circulars to parse
 		log.Printf("INFO: getting circulars")
-		circularsHtml, err := getCirculars()
+		circularsHtml, err := getCirculars(siteUrl)
 		if err != nil {
 			log.Printf("ERROR: %v", err)
 			continue
@@ -396,7 +429,7 @@ func main() {
 			nextCleanupTime = nextTime.Truncate(time.Hour).Add(6 * time.Hour)
 
 			log.Printf("INFO: removing deleted circulars")
-			removedCirculars, removedAttachments, err := deleteRemoveCirculars(circulars, connectionString)
+			removedCirculars, removedAttachments, err := deleteRemovedCirculars(circulars, connectionString)
 			if err != nil {
 				log.Printf("ERROR: %v", err)
 				continue
